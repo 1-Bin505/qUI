@@ -1,12 +1,10 @@
 // lib/services/inference_service.dart
 //
-// Loads .tflite model, runs inference on a 30-frame landmark sequence,
-// and returns the predicted ASL label + confidence.
-//
-// All heavy work (quantization + interpreter.run) is dispatched via
-// Flutter's compute() so it never blocks the UI/camera thread.
+// VERIFIED from ModelInspector:
+//   Input:  [1, 147, 30] float32  (landmarks × frames)
+//   Output: [1, 100]     float32  (100 ASL word classes)
+//   No quantization — model takes raw floats directly.
 
-import 'dart:isolate';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/services.dart' show rootBundle;
@@ -14,11 +12,9 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 import '../utils/constants.dart';
 import '../utils/preprocessor.dart';
 
-// ── Isolate message types ─────────────────────────────────
-
 class _InferenceInput {
-  final Uint8List modelBytes;       // raw .tflite bytes
-  final Float32List landmarkSeq;    // [30 * 147] float coords
+  final Uint8List modelBytes;
+  final Float32List landmarkSeq; // [30 * 147] = 4410 floats, frames-major
   final List<String> labels;
 
   _InferenceInput({
@@ -30,9 +26,9 @@ class _InferenceInput {
 
 class InferenceResult {
   final String label;
-  final double confidence;         // 0.0–1.0 after softmax
+  final double confidence;
   final int classIndex;
-  final List<double> allProbs;     // full softmax distribution
+  final List<double> allProbs;
 
   InferenceResult({
     required this.label,
@@ -43,10 +39,9 @@ class InferenceResult {
 
   @override
   String toString() =>
-      'InferenceResult(label: $label, confidence: ${(confidence * 100).toStringAsFixed(1)}%)';
+      'InferenceResult(label: $label, '
+      'confidence: ${(confidence * 100).toStringAsFixed(1)}%)';
 }
-
-// ── Main service class ────────────────────────────────────
 
 class InferenceService {
   Uint8List? _modelBytes;
@@ -56,12 +51,9 @@ class InferenceService {
   Future<void> initialize() async {
     if (_initialized) return;
 
-    // Load model bytes from assets
     final byteData = await rootBundle.load(ASLConstants.modelAssetPath);
     _modelBytes = byteData.buffer.asUint8List();
 
-    // Load label list from assets/labels.txt
-    // Format: one label per line, index = class index
     final labelsStr = await rootBundle.loadString(ASLConstants.labelsAssetPath);
     _labels = labelsStr
         .split('\n')
@@ -74,27 +66,16 @@ class InferenceService {
     _initialized = true;
   }
 
-  /// Run inference on a 30-frame landmark sequence.
-  /// [landmarkSeq] = Float32List of length 30 * 147 = 4410
-  ///
-  /// Dispatched to a background isolate via compute() — safe to call
-  /// from camera callback without blocking UI.
+  /// [landmarkSeq] = Float32List length 4410 (30 frames × 147 coords), frames-major.
+  /// Internally transposed to [1, 147, 30] before inference.
   Future<InferenceResult> predict(Float32List landmarkSeq) async {
-    assert(_initialized, 'Call initialize() before predict()');
-    assert(
-      landmarkSeq.length ==
-          ASLConstants.sequenceLength * ASLConstants.landmarkFlatSize,
-      'landmarkSeq must have ${ASLConstants.sequenceLength * ASLConstants.landmarkFlatSize} elements',
-    );
-
-    final input = _InferenceInput(
-      modelBytes: _modelBytes!,
-      landmarkSeq: landmarkSeq,
-      labels: _labels,
-    );
-
-    // Run entirely off the main isolate
-    return compute(_runInference, input);
+    assert(_initialized, 'Call initialize() first');
+    return compute(_runInference,
+        _InferenceInput(
+          modelBytes: _modelBytes!,
+          landmarkSeq: landmarkSeq,
+          labels: _labels,
+        ));
   }
 
   void dispose() {
@@ -104,42 +85,44 @@ class InferenceService {
 }
 
 // ── Top-level isolate function ────────────────────────────
-// Must be top-level (not a method) for compute() to serialize it.
 
 InferenceResult _runInference(_InferenceInput input) {
-  // 1. Create interpreter from raw bytes (works inside isolate)
   final interpreter = Interpreter.fromBuffer(input.modelBytes);
 
-  // 2. Quantize Float32 landmarks → Int8
-  final quantizedInput = Preprocessor.quantizeInput(input.landmarkSeq);
+  // Input is stored frames-major: [frame0_lm0..lm146, frame1_lm0..lm146, ...]
+  // Model expects [1, 147, 30] — landmarks-major (transposed).
+  // Transpose: output[lm][frame] = input[frame * 147 + lm]
+  final seq  = ASLConstants.sequenceLength;   // 30
+  final feat = ASLConstants.landmarkFlatSize; // 147
 
-  // 3. Reshape into [1, 30, 147] as required by model
-  //    tflite_flutter accepts nested List or reshaped buffers.
-  //    We reshape manually into a 3D list.
-  final inputTensor = _reshape(quantizedInput);
-
-  // 4. Prepare output buffer: [1, num_classes] Int8
-  final outputBuffer = List.generate(
-    1,
-    (_) => Int8List(ASLConstants.numClasses),
+  final transposed = List.generate(1, (_) =>
+    List.generate(feat, (lm) =>
+      List.generate(seq, (frame) =>
+        input.landmarkSeq[frame * feat + lm]
+      )
+    )
   );
 
-  // 5. Run interpreter
-  interpreter.run(inputTensor, outputBuffer);
+  // Output buffer: [1, 100] float32
+  final outputBuffer = List.generate(1, (_) => List.filled(ASLConstants.numClasses, 0.0));
+
+  interpreter.run(transposed, outputBuffer);
   interpreter.close();
 
-  // 6. Dequantize output Int8 → Float32 logits
-  final logits = Preprocessor.dequantizeOutput(outputBuffer[0] as Int8List);
+  // outputBuffer[0] = list of 100 float logits
+  final logits = Float32List.fromList(outputBuffer[0].cast<double>());
 
-  // 7. Softmax → probabilities
+  // Softmax → probabilities
   final probs = Preprocessor.softmax(logits);
 
-  // 8. Argmax → predicted class
+  // Argmax → predicted class
   final classIdx = Preprocessor.argmax(probs);
   final confidence = probs[classIdx];
   final label = classIdx < input.labels.length
       ? input.labels[classIdx]
-      : 'unknown_$classIdx';
+      : 'class_$classIdx';
+
+  print('[Inference] → $label (${(confidence * 100).toStringAsFixed(1)}%)');
 
   return InferenceResult(
     label: label,
@@ -147,17 +130,4 @@ InferenceResult _runInference(_InferenceInput input) {
     classIndex: classIdx,
     allProbs: probs.toList(),
   );
-}
-
-/// Reshape flat Int8List [4410] → List<List<List<int>>> [1][30][147]
-List<List<List<int>>> _reshape(Int8List flat) {
-  final seq = ASLConstants.sequenceLength;   // 30
-  final feat = ASLConstants.landmarkFlatSize; // 147
-
-  return List.generate(1, (_) {
-    return List.generate(seq, (f) {
-      final start = f * feat;
-      return flat.sublist(start, start + feat);
-    });
-  });
 }

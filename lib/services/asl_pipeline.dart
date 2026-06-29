@@ -1,8 +1,5 @@
-// lib/services/asl_pipeline.dart
-//
-// Orchestrates: Camera → LandmarkService → FrameBuffer → InferenceService → label
-
 import 'package:camera/camera.dart';
+import 'package:flutter/services.dart';
 import '../models/frame_buffer.dart';
 import '../utils/constants.dart';
 import 'landmark_service.dart';
@@ -17,9 +14,10 @@ class ASLPipeline {
   final FrameBuffer _frameBuffer = FrameBuffer();
 
   CameraController? _cameraController;
+  CameraDescription? _camera;
   bool _isRunning = false;
   bool _inferenceInProgress = false;
-  LandmarkFrame? _lastFrame; // used for sliding window padding
+  LandmarkFrame? _lastFrame;
 
   OnResultCallback? onResult;
   OnErrorCallback? onError;
@@ -33,18 +31,25 @@ class ASLPipeline {
 
     final cameras = await availableCameras();
     if (cameras.isEmpty) {
-      onError?.call('No cameras found on device.');
+      onError?.call('No cameras found.');
       return;
     }
 
+    // Front camera for self-facing signing
+    _camera = cameras.firstWhere(
+      (c) => c.lensDirection == CameraLensDirection.front,
+      orElse: () => cameras.first,
+    );
+
     _cameraController = CameraController(
-      cameras.first,
+      _camera!,
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420,
+      imageFormatGroup: ImageFormatGroup.nv21, // required for MLKit on Android
     );
 
     await _cameraController!.initialize();
+    print('[ASLPipeline] Initialized with ${_camera!.lensDirection} camera.');
   }
 
   void start() {
@@ -55,8 +60,15 @@ class ASLPipeline {
     _cameraController!.startImageStream((CameraImage image) async {
       if (!_isRunning) return;
 
-      final frame = await _landmarkService.extractFromFrame(image);
-      if (frame == null) return;
+      final orientation = _cameraController!.value.deviceOrientation;
+
+      final frame = await _landmarkService.extractFromFrame(
+        image,
+        _camera!,
+        orientation,
+      );
+
+      if (frame == null) return; // no pose detected
 
       _lastFrame = frame;
       _frameBuffer.add(frame);
@@ -64,14 +76,13 @@ class ASLPipeline {
       if (_frameBuffer.isReady && !_inferenceInProgress) {
         _inferenceInProgress = true;
         try {
-          final snapshot = _frameBuffer.snapshot;
-          final result = await _inferenceService.predict(snapshot);
+          final result = await _inferenceService.predict(_frameBuffer.snapshot);
           onResult?.call(result);
         } catch (e) {
           onError?.call('Inference error: $e');
         } finally {
           _inferenceInProgress = false;
-          // Slide window: advance by 10 frames using last known frame
+          // Slide window by 10 frames
           if (_lastFrame != null) {
             for (int i = 0; i < 10; i++) {
               _frameBuffer.add(_lastFrame!);
@@ -80,12 +91,15 @@ class ASLPipeline {
         }
       }
     });
+
+    print('[ASLPipeline] Started streaming.');
   }
 
   void stop() {
     _isRunning = false;
     _cameraController?.stopImageStream();
     _frameBuffer.clear();
+    print('[ASLPipeline] Stopped.');
   }
 
   void dispose() {
